@@ -3,12 +3,23 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/engine-api/client/transport/cancellable"
+
+	"golang.org/x/net/context"
 )
 
 // serverResponse is a wrapper for http API responses.
@@ -69,7 +80,56 @@ func (cli *Client) sendRequest(method, path string, query url.Values, body inter
 	return cli.sendClientRequest(method, path, query, params, headers)
 }
 
+func tryProxy(cli *Client) error {
+	proxyUrl := cli.transport.Scheme() + "://" + cli.addr + "/v" + cli.version + "/info"
+	logrus.Debug("proxy workaround url: " + proxyUrl)
+	proxyResp, err := http.Get(proxyUrl)
+	if err != nil {
+		logrus.Debug("failed to make request " + err.Error())
+		return err
+	}
+	logrus.Debug("made proxy workaround call, got status " + fmt.Sprint(proxyResp.StatusCode))
+	if proxyResp.StatusCode == 403 {
+		data, _ := ioutil.ReadAll(proxyResp.Body)
+		proxyResp.Body.Close()
+		matches := regexp.MustCompile(`.*"(http://.*http://.*)".*`).FindSubmatch([]byte(data))
+		if len(matches) >= 2 {
+			logrus.Debug("making proxy auth " + string(matches[1]))
+			resp, _ := http.Get(string(matches[1]))
+			resp.Body.Close()
+			logrus.Debug("proxy auth got status " + fmt.Sprint(resp.StatusCode))
+			return nil
+		}
+	} else {
+		logrus.Debug("non-proxy error")
+	}
+	return errors.New(fmt.Sprint("can not handle status code", proxyResp.StatusCode))
+}
+
 func (cli *Client) sendClientRequest(method, path string, query url.Values, body io.Reader, headers map[string][]string) (*serverResponse, error) {
+	retries, _ := strconv.Atoi(os.Getenv("DOCKER_HTTP_RETRY"))
+	var (
+		resp *serverResponse = nil
+		err  error           = errors.New("no requests made")
+	)
+	for try := 0; try <= retries; try++ {
+		resp, err = cli.doSendClientRequest(ctx, method, path, query, body, headers)
+		if err == nil {
+			break
+		}
+		logrus.Debug("failed, status " + fmt.Sprint(resp.statusCode))
+		if resp.statusCode == 407 || resp.statusCode == 403 || resp.statusCode == -1 {
+			tryProxy(cli)
+			time.Sleep(1 * time.Second)
+		} else {
+			logrus.Debug("not-retryable error")
+			break
+		}
+	}
+	return resp, err
+}
+
+func (cli *Client) doSendClientRequest(method, path string, query url.Values, body io.Reader, headers map[string][]string) (*serverResponse, error) {
 	serverResp := &serverResponse{
 		body:       nil,
 		statusCode: -1,
@@ -83,9 +143,19 @@ func (cli *Client) sendClientRequest(method, path string, query url.Values, body
 	req, err := cli.newRequest(method, path, query, body, headers)
 	req.URL.Host = cli.addr
 	req.URL.Scheme = cli.scheme
+	logrus.Debug("calling " + req.URL.String())
 
 	if expectedPayload && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "text/plain")
+	}
+
+	userAgent, found := syscall.Getenv("DOCKER_USER_AGENT")
+	if found {
+		if len(userAgent) == 0 {
+			req.Header.Del("User-Agent")
+		} else {
+			req.Header.Set("User-Agent", userAgent)
+		}
 	}
 
 	resp, err := cli.httpClient.Do(req)
