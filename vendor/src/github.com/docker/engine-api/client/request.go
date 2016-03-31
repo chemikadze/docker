@@ -17,9 +17,6 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/docker/engine-api/client/transport/cancellable"
-
-	"golang.org/x/net/context"
 )
 
 // serverResponse is a wrapper for http API responses.
@@ -81,7 +78,7 @@ func (cli *Client) sendRequest(method, path string, query url.Values, body inter
 }
 
 func tryProxy(cli *Client) error {
-	proxyUrl := cli.transport.Scheme() + "://" + cli.addr + "/v" + cli.version + "/info"
+	proxyUrl := cli.scheme + "://" + cli.addr + "/v" + cli.version + "/info"
 	logrus.Debug("proxy workaround url: " + proxyUrl)
 	proxyResp, err := http.Get(proxyUrl)
 	if err != nil {
@@ -113,7 +110,7 @@ func (cli *Client) sendClientRequest(method, path string, query url.Values, body
 		err  error           = errors.New("no requests made")
 	)
 	for try := 0; try <= retries; try++ {
-		resp, err = cli.doSendClientRequest(ctx, method, path, query, body, headers)
+		resp, err = cli.doSendClientRequest(method, path, query, body, headers)
 		if err == nil {
 			break
 		}
